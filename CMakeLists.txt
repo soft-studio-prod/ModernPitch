@@ -15,6 +15,7 @@ set(MODERNPITCH_SOURCE_URL "https://github.com/soft-studio-prod/ModernPitch"
 
 juce_add_plugin(ModernPitch
     COMPANY_NAME "Soft Studio"
+    COMPANY_WEBSITE "https://github.com/soft-studio-prod/ModernPitch"
     BUNDLE_ID "com.modernpitch.pitch"
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT FALSE

@@ -18,3 +18,6 @@ __pycache__/
 # Audio renders and test material
 *.wav
 *.mp3
+
+# Installer and release packages
+Installer/Output/

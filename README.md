@@ -18,6 +18,20 @@ engine that is tuned for guitar:
 Each section shows its current delay (`lag ~x ms`). The delay follows the
 note being played; there is no fixed window.
 
+## Installation (Windows)
+
+Download the latest release from the
+[Releases page](https://github.com/soft-studio-prod/ModernPitch/releases):
+
+- **Installer** (`ModernPitch-x.y.z-Windows-x64-Setup.exe`): installs the plugin
+  to `C:\Program Files\Common Files\VST3` and adds an uninstaller in
+  *Apps & features*. The installer is not code-signed, so Windows SmartScreen
+  may warn: choose *More info* → *Run anyway*.
+- **Zip** (`ModernPitch-x.y.z-Windows-x64-VST3.zip`): copy the
+  `ModernPitch.vst3` folder to `C:\Program Files\Common Files\VST3` yourself.
+
+Then rescan plugins in your DAW. Windows x64 only for now.
+
 ## How it works
 
 The engine is in `Source/PsolaEngine.h`. It is pitch-synchronous
@@ -96,6 +110,15 @@ repository. If you distribute builds of a fork, set
 The VST3 is written to `build/ModernPitch_artefacts/Release/VST3/`. It is
 also copied to the system VST3 folder. That copy fails while a DAW has the
 plugin loaded.
+
+To build the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php)
+and run, after a Release build:
+
+```sh
+ISCC Installer/ModernPitch.iss /DAppVersion=x.y.z
+```
+
+The installer is written to `Installer/Output/`.
 
 Note for localised MSVC with the NMake generator: CMake may miss changes to
 header files, because the localised `/showIncludes` output is not
