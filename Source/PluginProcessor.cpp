@@ -57,7 +57,17 @@ void ModernPitchAudioProcessor::prepareToPlay(double sampleRate, int samplesPerB
     psolaEngine.setImprovedTracking(useImprovedTracking);
     psolaEngine.setRestartOnNewNote(useNoteRestart);
     psolaEngine.setTightGrains(useTightGrains);
+    psolaEngine.setChordPeriodSearch(useChordPeriodSearch);
     psolaEngine.prepare(sampleRate);
+    spectralTune.prepare(sampleRate);
+    spectralOctave.prepare(sampleRate);
+    spectralTune.setRatioImmediately(std::pow(2.0, initialCombinedPitch / 12.0));
+    spectralOctave.setRatioImmediately(std::pow(2.0, (initialCombinedPitch - 12.0) / 12.0));
+    spectralOctaveRunning = false;
+    spectralTuneWeight.reset(sampleRate, 0.030);
+    spectralTuneWeight.setCurrentAndTargetValue(spectralWeight(initialCombinedPitch));
+    spectralOctaveWeight.reset(sampleRate, 0.030);
+    spectralOctaveWeight.setCurrentAndTargetValue(spectralWeight(initialCombinedPitch - 12.0f));
     psolaEngine.setPitchSemitones(0, initialCombinedPitch);
     psolaEngine.setPitchSemitones(1, initialCombinedPitch - 12.0f);
 
@@ -89,9 +99,19 @@ void ModernPitchAudioProcessor::prepareToPlay(double sampleRate, int samplesPerB
     setLatencySamples(0);
 }
 
+// Share of the phase vocoder for a shift: 1 at or below unison, 0 from
+// +1 semitone, linear in between.
+float ModernPitchAudioProcessor::spectralWeight(float semitones)
+{
+    return useSpectralEngine ? juce::jlimit(0.0f, 1.0f, 1.0f - semitones) : 0.0f;
+}
+
 void ModernPitchAudioProcessor::releaseResources()
 {
     psolaEngine.reset();
+    spectralTune.reset();
+    spectralOctave.reset();
+    spectralOctaveRunning = false;
 }
 
 bool ModernPitchAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -148,16 +168,67 @@ void ModernPitchAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     if ((int) trackedPeriods.size() < numSamples)
         trackedPeriods.resize((size_t) numSamples); // host exceeded the announced block size
     psolaEngine.process(sourceBuffer, tuneShiftedBuffer, octaveShiftedBuffer, trackedPeriods.data());
+    double tuneLag = psolaEngine.getLagSamples(0);
+    double octaveLag = psolaEngine.getLagSamples(1);
+    if (useSpectralEngine)
+    {
+        // Downward shifts use the phase vocoder, upward ones PSOLA; both run
+        // so that a Whammy sweep can crossfade between them.
+        spectralTuneBuffer.setSize(channels, numSamples, false, false, true);
+        spectralTune.setRatio(std::pow(2.0, combinedPitch / 12.0));
+        spectralTune.process(sourceBuffer, spectralTuneBuffer);
+        spectralTuneWeight.setTargetValue(spectralWeight(combinedPitch));
+        const float tuneWeightNow = spectralTuneWeight.getCurrentValue();
+        tuneLag = tuneWeightNow * spectralTune.getLatencySamples() + (1.0f - tuneWeightNow) * tuneLag;
+
+        const bool octaveNeeded = octaveEnabled && octaveMode == 0;
+        if (octaveNeeded && !spectralOctaveRunning)
+        {
+            spectralOctave.reset();
+            spectralOctave.setRatioImmediately(std::pow(2.0, (combinedPitch - 12.0) / 12.0));
+        }
+        spectralOctaveRunning = octaveNeeded;
+        spectralOctaveWeight.setTargetValue(spectralWeight(combinedPitch - 12.0f));
+        if (!octaveNeeded)
+        {
+            // Not processed, but keep the displayed delay meaningful.
+            spectralOctave.setRatioImmediately(std::pow(2.0, (combinedPitch - 12.0) / 12.0));
+            const float octaveWeightNow = spectralOctaveWeight.getCurrentValue();
+            octaveLag = octaveWeightNow * spectralOctave.getLatencySamples() + (1.0f - octaveWeightNow) * octaveLag;
+        }
+        else
+        {
+            spectralOctaveBuffer.setSize(channels, numSamples, false, false, true);
+            spectralOctave.setRatio(std::pow(2.0, (combinedPitch - 12.0) / 12.0));
+            spectralOctave.process(sourceBuffer, spectralOctaveBuffer);
+            const float octaveWeightNow = spectralOctaveWeight.getCurrentValue();
+            octaveLag = octaveWeightNow * spectralOctave.getLatencySamples() + (1.0f - octaveWeightNow) * octaveLag;
+        }
+        for (int sample = 0; sample < numSamples; ++sample)
+        {
+            const float tuneWeight = spectralTuneWeight.getNextValue();
+            const float octaveWeight = spectralOctaveWeight.getNextValue();
+            for (int ch = 0; ch < channels; ++ch)
+            {
+                tuneShiftedBuffer.setSample(ch, sample, tuneWeight * spectralTuneBuffer.getSample(ch, sample)
+                                                       + (1.0f - tuneWeight) * tuneShiftedBuffer.getSample(ch, sample));
+                if (octaveNeeded)
+                    octaveShiftedBuffer.setSample(ch, sample,
+                        octaveWeight * spectralOctaveBuffer.getSample(ch, sample)
+                        + (1.0f - octaveWeight) * octaveShiftedBuffer.getSample(ch, sample));
+            }
+        }
+    }
     // The ring modulates the main path: shifted (delayed by the engine lag)
     // when a shift is active, the dry input otherwise.
-    const double ringLag = pitchActive ? psolaEngine.getLagSamples(0) : 0.0;
+    const double ringLag = pitchActive ? tuneLag : 0.0;
     const double ringRatio = pitchActive ? psolaEngine.getCurrentRatio(0) : 1.0;
     compensationPitchSmoother.setTargetValue(pitchActive ? combinedPitch : 0.0f);
     compensationAmountSmoother.setTargetValue(
         parameters.getRawParameterValue("eqCompEnabled")->load() > 0.5f ? 1.0f : 0.0f);
     lowCutSmoother.setTargetValue(parameters.getRawParameterValue("octaveLowCut")->load());
-    tuneLagMs.store((float) (1000.0 * psolaEngine.getLagSamples(0) / getSampleRate()));
-    octaveLagMs.store((float) (1000.0 * psolaEngine.getLagSamples(1) / getSampleRate()));
+    tuneLagMs.store((float) (1000.0 * tuneLag / getSampleRate()));
+    octaveLagMs.store((float) (1000.0 * octaveLag / getSampleRate()));
 
     for (int sample = 0; sample < numSamples; ++sample)
     {

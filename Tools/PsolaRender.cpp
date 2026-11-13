@@ -13,14 +13,24 @@
 //       --legacy      YIN note tracking (setImprovedTracking(false))
 //       --no-restart  keep the old grain train on a new note
 //       --tight       shorter pitched grains
+//       --no-chords   no chord period search
 //       --events      also write <name>.events.csv (detector, marks, grains)
 //       --ring        write the RING voice (wet) instead of the shifted signal
+//       --spectral    use the low-latency phase-vocoder engine (SpectralShifter)
+//
+//   PsolaRender plugin <input.wav> <output.wav> [param=value ...]
+//       Runs the whole plugin processor (both engines, mixing, Octaver,
+//       Ring, EQ) with the given parameters (plugin units, e.g. pitch=-12
+//       octaveEnabled=1 octaveMix=50 octaveMode=1), and prints the CPU speed.
 
 #include <JuceHeader.h>
 #include "../Source/PsolaEngine.h"
 #include "../Source/RingModulator.h"
+#include "../Source/SpectralShifter.h"
+#include "../Source/PluginProcessor.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <vector>
 
 namespace
@@ -33,6 +43,8 @@ struct Settings
     bool restartOnNewNote = true;
     bool tightGrains = false;
     bool ring = false;
+    bool spectral = false;
+    bool chordPeriodSearch = true;
 };
 
 struct RenderStats
@@ -49,6 +61,7 @@ RenderStats render(PsolaEngine& engine, const Settings& settings, float semitone
     engine.setImprovedTracking(settings.improvedTracking);
     engine.setRestartOnNewNote(settings.restartOnNewNote);
     engine.setTightGrains(settings.tightGrains);
+    engine.setChordPeriodSearch(settings.chordPeriodSearch);
     engine.prepare(sampleRate);
     engine.setPitchSemitones(0, semitones);
     engine.setPitchSemitones(1, semitones - 12.0f);
@@ -99,6 +112,39 @@ RenderStats render(PsolaEngine& engine, const Settings& settings, float semitone
     stats.realtimeFactor = elapsed > 0.0 ? ((double) length / sampleRate) / elapsed : 0.0;
     const auto& kinds = engine.getGrainKindSamples(0);
     stats.pitchedShare = (double) kinds[0] / (double) juce::jmax<int64_t>(1, kinds[0] + kinds[1]);
+    return stats;
+}
+
+RenderStats renderSpectral(float semitones, const juce::AudioBuffer<float>& input,
+                           juce::AudioBuffer<float>& output, double sampleRate)
+{
+    auto shifter = std::make_unique<SpectralShifter>();
+    if (const char* hopFraction = std::getenv("SPECTRAL_HOP"))
+        shifter->setHopFraction(std::atof(hopFraction));
+    shifter->prepare(sampleRate);
+    shifter->setRatioImmediately(std::pow(2.0, semitones / 12.0));
+    const int channels = input.getNumChannels();
+    const int length = input.getNumSamples();
+    output.setSize(channels, length);
+    juce::AudioBuffer<float> in(channels, blockSize), out(channels, blockSize);
+    const auto started = std::chrono::steady_clock::now();
+    for (int start = 0; start < length; start += blockSize)
+    {
+        const int n = juce::jmin(blockSize, length - start);
+        in.setSize(channels, n, false, false, true);
+        out.setSize(channels, n, false, false, true);
+        for (int ch = 0; ch < channels; ++ch)
+            in.copyFrom(ch, 0, input, ch, start, n);
+        shifter->process(in, out);
+        for (int ch = 0; ch < channels; ++ch)
+            output.copyFrom(ch, start, out, ch, 0, n);
+    }
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    RenderStats stats;
+    stats.averageLagMs = 1000.0 * shifter->getLatencySamples() / sampleRate;
+    stats.realtimeFactor = elapsed > 0.0 ? ((double) length / sampleRate) / elapsed : 0.0;
+    stats.pitchedShare = 1.0;
+    std::printf("  spectral: %d onsets, %d phase resets\n", shifter->getOnsetCount(), shifter->getResetCount());
     return stats;
 }
 
@@ -309,6 +355,8 @@ int runRender(int argc, char* argv[])
         else if (arg == "--tight")      settings.tightGrains = true;
         else if (arg == "--events")     events = true;
         else if (arg == "--ring")       settings.ring = true;
+        else if (arg == "--spectral")   settings.spectral = true;
+        else if (arg == "--no-chords")  settings.chordPeriodSearch = false;
         else                            shifts.push_back((float) arg.getDoubleValue());
     }
     if (shifts.empty())
@@ -336,7 +384,8 @@ int runRender(int argc, char* argv[])
     {
         std::vector<PsolaEngine::Event> log;
         engine->setEventLog(events ? &log : nullptr);
-        const auto stats = render(*engine, settings, shift, input, output, sampleRate);
+        const auto stats = settings.spectral ? renderSpectral(shift, input, output, sampleRate)
+                                             : render(*engine, settings, shift, input, output, sampleRate);
         engine->setEventLog(nullptr);
         std::printf("%+6.0f %8.1f %9.1f %6.0f\n", shift, stats.averageLagMs, 100.0 * stats.pitchedShare,
                     stats.realtimeFactor);
@@ -349,6 +398,58 @@ int runRender(int argc, char* argv[])
     }
     return 0;
 }
+int runPlugin(int argc, char* argv[])
+{
+    // The processor's parameter tree needs JUCE's message manager.
+    juce::ScopedJuceInitialiser_GUI juceInitialiser;
+    const auto cwd = juce::File::getCurrentWorkingDirectory();
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(cwd.getChildFile(argv[2])));
+    if (reader == nullptr)
+        return 1;
+    const int channels = (int) juce::jmin(2u, reader->numChannels);
+    juce::AudioBuffer<float> audio(channels, (int) reader->lengthInSamples);
+    reader->read(&audio, 0, (int) reader->lengthInSamples, 0, true, channels > 1);
+    const double sampleRate = reader->sampleRate;
+
+    // Large (several MB of buffers): heap, as a host would do.
+    auto owner = std::make_unique<ModernPitchAudioProcessor>();
+    auto& processor = *owner;
+    for (int i = 4; i < argc; ++i)
+    {
+        const juce::String arg(argv[i]);
+        auto* parameter = processor.parameters.getParameter(arg.upToFirstOccurrenceOf("=", false, false));
+        if (parameter == nullptr)
+        {
+            std::printf("unknown parameter %s\n", arg.toRawUTF8());
+            return 1;
+        }
+        auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(parameter);
+        ranged->setValueNotifyingHost(ranged->convertTo0to1(arg.fromFirstOccurrenceOf("=", false, false).getFloatValue()));
+    }
+    processor.setPlayConfigDetails(channels, channels, sampleRate, blockSize);
+    processor.prepareToPlay(sampleRate, blockSize);
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> block(channels, blockSize);
+    const auto started = std::chrono::steady_clock::now();
+    for (int start = 0; start < audio.getNumSamples(); start += blockSize)
+    {
+        const int n = juce::jmin(blockSize, audio.getNumSamples() - start);
+        block.setSize(channels, n, false, false, true);
+        for (int ch = 0; ch < channels; ++ch)
+            block.copyFrom(ch, 0, audio, ch, start, n);
+        processor.processBlock(block, midi);
+        for (int ch = 0; ch < channels; ++ch)
+            audio.copyFrom(ch, start, block, ch, 0, n);
+    }
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::printf("plugin: %.0fx real time (%.1f %% of one core), tune lag %.1f ms, octave lag %.1f ms\n",
+                audio.getNumSamples() / sampleRate / elapsed, 100.0 * elapsed / (audio.getNumSamples() / sampleRate),
+                processor.getTuneLagMs(), processor.getOctaveLagMs());
+    writeWav(cwd.getChildFile(argv[3]), audio, sampleRate);
+    return 0;
+}
 } // namespace
 
 int main(int argc, char* argv[])
@@ -358,10 +459,12 @@ int main(int argc, char* argv[])
         return runSyntheticTest();
     if (command == "render" && argc >= 4)
         return runRender(argc, argv);
+    if (command == "plugin" && argc >= 4)
+        return runPlugin(argc, argv);
 
     std::printf("usage:\n"
                 "  PsolaRender synth\n"
                 "  PsolaRender render <input.wav> <outputDir> [semitones ...]"
-                " [--legacy] [--no-restart] [--tight] [--events] [--ring]\n");
+                " [--legacy] [--no-restart] [--tight] [--no-chords] [--events] [--ring] [--spectral]\n");
     return 1;
 }

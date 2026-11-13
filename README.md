@@ -34,6 +34,24 @@ Then rescan plugins in your DAW. Windows x64 only for now.
 
 ## How it works
 
+Two engines share the work:
+
+- **Spectral engine** (`Source/SpectralShifter.h`), used for downward shifts
+  (TUNE drops, the OCTAVER): a low-latency phase vocoder. The input is read
+  at the target speed with a band-limited sinc interpolator, then analysed
+  with a long *asymmetric* window (4096 samples rising, 192 falling). The
+  long rise gives the low-frequency resolution chords need; the short fall
+  sets the delay to M × (1 + ratio): 6.5 ms at −12, 9 ms at unison (44.1 kHz).
+  Only the 2M samples around the window peak are synthesised. At each pick
+  attack (causal energy detector) the synthesis phases are reset, so attacks
+  stay sharp. On a chord DI at −12 it scores like Hypertune (energy on the
+  ideal lines 0.996, spectral match 0.942 vs 0.997 / 0.945).
+- **PSOLA engine** (described below), used for upward shifts, where it is
+  cleaner and faster. The two crossfade between 0 and +1 semitone of total
+  shift, so a Whammy sweep moves from one to the other smoothly.
+
+### PSOLA engine
+
 The engine is in `Source/PsolaEngine.h`. It is pitch-synchronous
 overlap-add (PSOLA) with **resampled grains**. The whole harmonic series
 scales, as if the string itself were retuned, which keeps octave-down
@@ -46,6 +64,11 @@ clean.
    samples. A new note is therefore recognised after about two of its own
    periods, instead of after a window sized for the lowest string. A new
    estimate arrives every 2.5 ms.
+   **Chord period search:** a fifth only repeats one octave below its root,
+   so a low power chord has no period in the single-note range (down to
+   40 Hz). When the best period is only weakly periodic, the detector also
+   tests 2×, 3× and 4× that period, down to 20 Hz, and keeps the first one
+   that is clearly more periodic. Single notes never trigger it.
 2. **Note tracking.** Pitch marks are placed one period apart by waveform
    correlation. Several rules make this robust on low strings:
    - short ×2/×3/×4 jumps of the estimate (octave errors) are ignored while
@@ -71,8 +94,11 @@ clean.
    delayed by the engine's current lag, so it stays in sync with the shifted
    signal. When no pitch is locked, the last frequency is held.
 
-PSOLA is monophonic by nature. Chords are handled by the granular fallback
-and sound less clean than single notes.
+In the PSOLA engine (upward shifts), one period is followed at a time. Power chords and octaves are periodic, so
+they shift cleanly. A low power chord has a long period, though, so its delay
+is higher: about 38 ms at −12 and 24 ms at −5 on A1 + E2. Chords with thirds
+are only roughly periodic and sound less clean. Unpitched input uses the
+granular fallback.
 
 Host latency (PDC) is reported as 0. The real delay depends on the note and
 the shift. On a 24 s DI riff, the mean delay was 12 ms at −12, 7.5 ms at
@@ -88,6 +114,8 @@ in `Source/PluginProcessor.h`:
 | `useImprovedTracking` | `true` | `false`: YIN detector, two estimates to lock, no octave-error rejection |
 | `useNoteRestart` | `true` | `false`: the previous grain train keeps running until its next grain |
 | `useTightGrains` | `false` | `true`: grains 1.4 periods long. 1–3 ms less delay, but rougher attacks |
+| `useSpectralEngine` | `true` | `false`: PSOLA for every shift (lower delay on small shifts, but chords are not clean) |
+| `useChordPeriodSearch` | `true` | `false`: power chords follow the root only. Less delay on low chords, but they sound smeared |
 
 ## Build
 
@@ -132,12 +160,15 @@ Build it with `-DMODERNPITCH_BUILD_TOOLS=ON`:
 
 ```sh
 PsolaRender synth                                  # synthetic plucks: pitch error, attack delay, lag
-PsolaRender render in.wav outDir -12 -5 7 [--legacy] [--no-restart] [--tight] [--events] [--ring]
+PsolaRender render in.wav outDir -12 -5 7 [--legacy] [--no-restart] [--tight] [--no-chords] [--events] [--ring] [--spectral]
 ```
 
 `render` uses the plugin's settings and writes one WAV per shift.
 `--events` also writes a CSV with the detector estimates, pitch marks and
-grains. `--ring` writes the Ring voice (wet) instead of the shifted
+grains. `--spectral` renders with the spectral engine instead of PSOLA.
+`PsolaRender plugin in.wav out.wav pitch=-12 octaveEnabled=1 ...` runs the
+whole plugin processor with the given parameters and prints its CPU use.
+`--ring` writes the Ring voice (wet) instead of the shifted
 signal.
 
 The measurement scripts are in `Tools/analysis/` (Python;
@@ -165,6 +196,8 @@ frames are those where the output is much less periodic than the input.
 | 0.2.6 | Late grains start from zero | Clicks at −12: 26 → 0 |
 | 0.2.7 | Grain restart on a new note | Rough frames at −12: 11.8 → 7.0 %; at −5: 5.5 → 1.5 % |
 | 0.3.1 | Ring rebuilt: main signal × sine at F/2, driven by the engine's tracking | Energy on the ring lines: 0.32 → 0.92; off-tune frames: 97 → 1.5 % |
+| 0.3.3 | Chord period search | Low fifth (A1 + E2) at −12: harmonic purity 0.28 → 0.99; DI riff unchanged |
+| 0.4.0 | Low-latency spectral engine for downward shifts (asymmetric-window phase vocoder, phase reset at attacks) | Chords at −12: energy on ideal lines 0.971 → 0.996, spectral match 0.916 → 0.942; attacks median 7.6 ms / p90 12 ms; delay 6.5 ms at −12 |
 
 Two ideas were tried and rejected:
 

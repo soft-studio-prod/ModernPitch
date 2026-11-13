@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(ModernPitch VERSION 0.3.2)
+project(ModernPitch VERSION 0.4.0)
 
 if(NOT DEFINED JUCE_PATH)
     message(FATAL_ERROR "Please provide -DJUCE_PATH=C:/path/to/JUCE")
@@ -37,6 +37,7 @@ target_sources(ModernPitch PRIVATE
     Source/PsolaEngine.h
     Source/PsolaPitchDetector.h
     Source/RingModulator.h
+    Source/SpectralShifter.h
     Source/ToneFilters.h
 )
 
@@ -61,9 +62,12 @@ juce_generate_juce_header(ModernPitch)
 option(MODERNPITCH_BUILD_TOOLS "Build the offline PSOLA render tool" OFF)
 if(MODERNPITCH_BUILD_TOOLS)
     juce_add_console_app(PsolaRender PRODUCT_NAME "PsolaRender")
-    target_sources(PsolaRender PRIVATE Tools/PsolaRender.cpp)
+    target_sources(PsolaRender PRIVATE Tools/PsolaRender.cpp
+        Source/PluginProcessor.cpp Source/PluginEditor.cpp)
     target_compile_features(PsolaRender PRIVATE cxx_std_17)
-    target_compile_definitions(PsolaRender PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
-    target_link_libraries(PsolaRender PRIVATE juce::juce_audio_formats juce::juce_audio_basics)
+    target_compile_definitions(PsolaRender PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
+        MODERNPITCH_VERSION=\"${PROJECT_VERSION}\" MODERNPITCH_SOURCE_URL=\"${MODERNPITCH_SOURCE_URL}\"
+        MODERNPITCH_OFFLINE_TOOL=1)
+    target_link_libraries(PsolaRender PRIVATE juce::juce_audio_utils juce::juce_dsp)
     juce_generate_juce_header(PsolaRender)
 endif()

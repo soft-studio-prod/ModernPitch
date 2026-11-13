@@ -7,6 +7,7 @@
 #include <vector>
 #include "PsolaEngine.h"
 #include "RingModulator.h"
+#include "SpectralShifter.h"
 #include "ToneFilters.h"
 
 class ModernPitchAudioProcessor : public juce::AudioProcessor
@@ -52,15 +53,27 @@ public:
     static constexpr bool useImprovedTracking = true;  // false: YIN note tracking
     static constexpr bool useNoteRestart = true;       // false: no grain restart on a new note
     static constexpr bool useTightGrains = false;      // true: -1..3 ms delay, rougher attacks
+    static constexpr bool useChordPeriodSearch = true; // false: power chords track the root only
+    // Low-latency phase vocoder for downward shifts (cleaner chords). Upward
+    // shifts keep the PSOLA engine; the two crossfade between 0 and +1 st.
+    static constexpr bool useSpectralEngine = true;
 
 private:
     void updateToneFilters();
+    static float spectralWeight(float semitones);
     static constexpr int toneUpdateInterval = 32;
 
     juce::AudioBuffer<float> sourceBuffer;
     juce::AudioBuffer<float> tuneShiftedBuffer;
     juce::AudioBuffer<float> octaveShiftedBuffer;
     PsolaEngine psolaEngine;
+    SpectralShifter spectralTune;
+    SpectralShifter spectralOctave;
+    juce::AudioBuffer<float> spectralTuneBuffer;
+    juce::AudioBuffer<float> spectralOctaveBuffer;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> spectralTuneWeight;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> spectralOctaveWeight;
+    bool spectralOctaveRunning = false;
     RingModulator ringModulator;
     std::vector<float> trackedPeriods;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> octaveMixSmoother;

@@ -112,6 +112,9 @@ public:
     // Per-note phase alignment (default). Offline comparison only.
     void setPhaseAlignment(bool enabled) { phaseAlignment = enabled; }
 
+    // Chord period search, see PsolaPitchDetector::setChordPeriodSearch.
+    void setChordPeriodSearch(bool enabled) { detector.setChordPeriodSearch(enabled); }
+
     // Detector choice for offline experiments.
     void setDetectorMethod(PsolaPitchDetector::Method method) { detector.setMethod(method); }
 

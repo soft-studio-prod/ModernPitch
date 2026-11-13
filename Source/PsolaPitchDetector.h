@@ -27,7 +27,9 @@ public:
         bool voiced = false;
     };
 
-    // 40 Hz covers an 8-string in standard tuning (F#1 = 46 Hz) with margin.
+    // Lowest single-note period searched: 40 Hz covers an 8-string in
+    // standard tuning (F#1 = 46 Hz) with margin. Chords can go lower, see
+    // setChordPeriodSearch.
     static constexpr float minimumFrequencyHz = 40.0f;
     static constexpr float maximumFrequencyHz = 1100.0f;
 
@@ -38,7 +40,10 @@ public:
         minLag = juce::jmax(2, (int) std::floor(decimatedRate / maximumFrequencyHz));
         maxLag = juce::jmin(lagCapacity - 2, (int) std::ceil(decimatedRate / minimumFrequencyHz));
         windowLength = maxLag;
-        frameLength = windowLength + maxLag + 2;
+        chordMaxLag = juce::jmin(lagCapacity - 4, (int) std::ceil(decimatedRate / chordMinimumFrequencyHz));
+        // Long enough for the chord search; short lags only use the newest
+        // samples, so this does not change single-note estimates.
+        frameLength = juce::jmax(windowLength + maxLag + 2, 2 * chordMaxLag + 4);
         warmUpLength = juce::jmin(frameCapacity, 3 * maxLag);
         hop = juce::jmax(4, (int) std::lround(decimatedRate * 0.0025));
         minimumWindow = juce::jlimit(8, maxLag, (int) std::lround(decimatedRate * 0.010));
@@ -56,6 +61,11 @@ public:
     }
 
     void setMethod(Method newMethod) { method = newMethod; }
+    // Chord period search: when the best period is only weakly periodic
+    // (typical of a chord), also test 2x, 3x and 4x that period, down to
+    // 20 Hz. A fifth only repeats one octave below its root, so a low power
+    // chord has no period inside the single-note range.
+    void setChordPeriodSearch(bool enabled) { chordSearch = enabled; }
 
     // Push one full-rate, already low-passed sample. Returns true when a new
     // estimate is available.
@@ -80,10 +90,14 @@ public:
     const Estimate& getEstimate() const { return estimate; }
 
 private:
-    static constexpr int lagCapacity = 512;
+    static constexpr int lagCapacity = 1024;
     static constexpr int frameCapacity = 2 * lagCapacity + 4;
-    static constexpr int ringSize = 2048;
+    static constexpr int ringSize = 4096;
     static constexpr int ringMask = ringSize - 1;
+    static constexpr float chordMinimumFrequencyHz = 20.0f;
+    static constexpr float chordTriggerScore = 0.92f;
+    static constexpr double chordAcceptScore = 0.90;
+    static constexpr double chordMinimumGain = 0.08;
     // -60 dBFS RMS: below this the frame is treated as silence.
     static constexpr float silenceRms = 0.001f;
 
@@ -114,7 +128,8 @@ private:
         float confidence = 0.0f;
         const bool voiced = method == Method::Yin ? analyseYin(lag, confidence)
                                                   : analyseAdaptiveMpm(lag, confidence);
-        estimate.voiced = voiced && lag >= (double) minLag && lag <= (double) maxLag;
+        estimate.voiced = voiced && lag >= (double) minLag
+                       && lag <= (double) (chordSearch ? chordMaxLag : maxLag);
         estimate.confidence = confidence;
         if (estimate.voiced)
             estimate.period = lag * (double) decimation;
@@ -181,7 +196,56 @@ private:
             }
             curve[(size_t) tau] = energy > 1.0e-12 ? (float) (2.0 * cross / energy) : 0.0f;
         }
-        return pickKeyMaximum(lag, confidence);
+        const bool voiced = pickKeyMaximum(lag, confidence);
+        if (chordSearch && lag > 0.0)
+            return searchChordPeriod(lag, confidence) || voiced;
+        return voiced;
+    }
+
+    double nsdfAt(int tau) const
+    {
+        const int window = juce::jmax(tau, minimumWindow);
+        double cross = 0.0, energy = 0.0;
+        for (int j = frameLength - window; j < frameLength; ++j)
+        {
+            const double current = frame[(size_t) j];
+            const double delayed = frame[(size_t) (j - tau)];
+            cross += current * delayed;
+            energy += current * current + delayed * delayed;
+        }
+        return energy > 1.0e-12 ? 2.0 * cross / energy : 0.0;
+    }
+
+    // Replaces lag by the smallest multiple of it that is clearly more
+    // periodic. Returns true when it did.
+    bool searchChordPeriod(double& lag, float& confidence) const
+    {
+        if (confidence >= chordTriggerScore)
+            return false;
+        for (int multiple = 2; multiple <= 4; ++multiple)
+        {
+            const int centre = (int) std::lround(lag * multiple);
+            if (centre + 3 > chordMaxLag)
+                break;
+            int bestTau = centre;
+            double best = -1.0;
+            for (int tau = centre - 2; tau <= centre + 2; ++tau)
+            {
+                const double value = nsdfAt(tau);
+                if (value > best)
+                {
+                    best = value;
+                    bestTau = tau;
+                }
+            }
+            if (best >= chordAcceptScore && best >= confidence + chordMinimumGain)
+            {
+                lag = bestTau + parabolicOffset(nsdfAt(bestTau - 1), best, nsdfAt(bestTau + 1));
+                confidence = (float) best;
+                return true;
+            }
+        }
+        return false;
     }
 
     // McLeod key-maximum picking: the first positive-lobe peak within 90 % of
@@ -235,6 +299,8 @@ private:
     std::array<float, lagCapacity + 2> curve {};
     Estimate estimate;
     Method method = Method::AdaptiveMpm;
+    bool chordSearch = false;
+    int chordMaxLag = 600;
     int decimation = 4;
     int minLag = 10;
     int maxLag = 300;
